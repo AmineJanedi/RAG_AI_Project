@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+langchain
+chromadb
+pypdf
+ollama
+tiktoken
+ezdxf
+reportlab
+requests
