@@ -1,65 +1,119 @@
 # backend/app.py
-from fastapi import FastAPI
-from pydantic import BaseModel
-import ollama
-from rag_module import load_rag_context, query_rag
-from dwg_generator import create_dwg_from_json
-from report_generator import estimate_cost, generate_report
+"""
+FastAPI backend with:
+- /chat     : streams LLM responses (forwarding from Ollama streaming)
+- /generate-dwg : accepts prompt or layout JSON, returns DXF + reports
+Serves outputs from backend_outputs/ for download.
+"""
+
+import os
 import json
+from fastapi import FastAPI, Form, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from typing import AsyncGenerator
 
-app = FastAPI()
+from ollama_client import query_ollama
+from rag_module import query_rag
+from dwg_generator import create_dxf_from_layout
+from report_generator import generate_technical_report, generate_financial_report
 
-vector_store = load_rag_context()
+BASE_DIR = os.path.dirname(__file__)
+OUTPUT_DIR = os.path.join(BASE_DIR, "../backend_outputs")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-class PromptRequest(BaseModel):
-    prompt: str
+app = FastAPI(title="FireAI Backend")
 
-@app.post("/generate")
-def generate_design(request: PromptRequest):
-    rag_context = query_rag(vector_store, request.prompt)
+# mount endpoint to serve output files directly
+app.mount("/backend_outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 
-    final_prompt = f"""
-    You are an architectural AI assistant. 
-    Based on the user's request and company standards below, 
-    create a JSON layout (rooms, sprinklers).
+@app.get("/")
+def home():
+    return {"message": "FireAI backend running"}
 
-    Context:
-    {rag_context}
-
-    User Request:
-    {request.prompt}
-
-    Output only valid JSON.
-    Example:
-    {{
-        "rooms": [{{"name": "Office", "x": 0, "y": 0, "width": 5000, "height": 4000}}],
-        "sprinklers": [{{"x": 1000, "y": 1000}}, {{"x": 4000, "y": 3000}}]
-    }}
+@app.post("/chat")
+def chat(prompt: str = Form(...)):
     """
+    Streams response from Ollama to client (chunked text).
+    The frontend can read the stream and display typing effect.
+    """
+    # get RAG context (optional)
+    context = query_rag(prompt)
+    full_prompt = f"Context:\n{context}\n\nUser Prompt:\n{prompt}\n\nPlease answer concisely."
 
-    response = ollama.chat(model="llama3", messages=[{"role": "user", "content": final_prompt}])
-    raw_output = response["message"]["content"]
+    # request streaming from Ollama
+    gen = query_ollama(full_prompt, stream=True)
 
+    def event_stream() -> AsyncGenerator[bytes, None]:
+        try:
+            # gen is a generator yielding small strings
+            for chunk in gen:
+                if not chunk:
+                    continue
+                # ensure bytes and yield
+                text = str(chunk)
+                # yield as simple chunks (not SSE) - client reads iter_lines
+                yield (text).encode("utf-8")
+        except Exception as e:
+            yield f"[ERR]{str(e)}".encode("utf-8")
+    return StreamingResponse(event_stream(), media_type="text/plain")
+
+@app.post("/generate-dwg")
+async def generate_dwg(prompt: str = Form(None), layout_json: str = Form(None), upload: UploadFile = File(None)):
+    """
+    Modes:
+    - If layout_json provided: use it.
+    - If upload provided: expect JSON file and use it.
+    - If prompt provided: ask LLM to return JSON layout, then create DXF + reports.
+    Returns URLs to download DXF + technical + financial reports (served under /backend_outputs).
+    """
+    if upload:
+        raw = await upload.read()
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid uploaded JSON: {e}")
+    elif layout_json:
+        try:
+            payload = json.loads(layout_json)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+    elif prompt:
+        context = query_rag(prompt)
+        ai_input = f"Context:\n{context}\n\nUser Request:\n{prompt}\n\nReturn ONLY JSON with keys: rooms (list), sprinklers (list). Rooms must have name,x,y,width,height (in mm)."
+        ai_resp = query_ollama(ai_input, stream=False)
+        # try parse JSON (strip fenced code)
+        text = ai_resp.strip()
+        if text.startswith("```"):
+            text = "\n".join(text.splitlines()[1:-1])
+        try:
+            payload = json.loads(text)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to parse JSON from LLM: {e}; raw_output={ai_resp[:1000]}")
+    else:
+        raise HTTPException(status_code=400, detail="Provide prompt, layout_json, or upload a JSON file.")
+
+    # generate DXF
     try:
-        layout_data = json.loads(raw_output)
-
-        # 1. Create DWG
-        create_dwg_from_json(layout_data)
-
-        # 2. Estimate costs
-        cost_data = estimate_cost(layout_data)
-
-        # 3. Generate report
-        generate_report(layout_data, cost_data)
-
-        return {
-            "status": "success",
-            "layout": layout_data,
-            "cost_summary": cost_data,
-            "files": ["output_design.dwg", "design_report.pdf"]
-        }
-
+        dxf_path = create_dxf_from_layout(payload)
     except Exception as e:
-        return {"status": "error", "message": str(e), "raw_output": raw_output}
-#Run command : 
-#python -m uvicorn app:app --reload
+        raise HTTPException(status_code=500, detail=f"DXF generation failed: {e}")
+
+    # generate reports
+    tech_path = generate_technical_report(payload)
+    fin_path = generate_financial_report(payload)
+
+    # convert paths to URLs served by FastAPI static route
+    def to_url(p):
+        fname = os.path.basename(p)
+        return f"/backend_outputs/{fname}"
+
+    return JSONResponse({
+        "status": "success",
+        "layout": payload,
+        "files": {
+            "dxf": to_url(dxf_path),
+            "technical_report": to_url(tech_path),
+            "financial_report": to_url(fin_path)
+        }
+    })

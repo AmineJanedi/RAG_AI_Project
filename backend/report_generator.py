@@ -1,72 +1,91 @@
 # backend/report_generator.py
+"""
+Generates:
+- Technical report (PDF) summarizing layout, counts, basic notes
+- Financial report (PDF) with a simple cost estimate
+Uses reportlab.
+"""
+
+import os
 from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from datetime import datetime
+import uuid
 
-def estimate_cost(layout_data):
-    """Simple mock cost estimation (you can improve formulas)."""
-    room_cost = 50  # per m²
-    sprinkler_cost = 120  # per unit
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "../backend_outputs")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    total_room_area = 0
-    for room in layout_data.get("rooms", []):
-        area = (room["width"] * room["height"]) / 1_000_000  # mm² → m²
-        total_room_area += area
+def estimate_cost(layout: dict) -> dict:
+    # Basic cost formula — adjust to your price list
+    sprinkler_unit_cost = 120.0  # currency unit per sprinkler
+    area_unit_cost = 10.0       # per m2
+    total_area_mm2 = 0
+    for r in layout.get("rooms", []):
+        w = float(r.get("width", 0))
+        h = float(r.get("height", 0))
+        area_m2 = (w * h) / 1_000_000.0
+        total_area_mm2 += area_m2
 
-    total_sprinklers = len(layout_data.get("sprinklers", []))
-    total_cost = (total_room_area * room_cost) + (total_sprinklers * sprinkler_cost)
+    total_sprinklers = len(layout.get("sprinklers", []))
+    cost = total_sprinklers * sprinkler_unit_cost + total_area_mm2 * area_unit_cost
+    return {"total_area_m2": round(total_area_mm2,2), "total_sprinklers": total_sprinklers, "estimated_cost": round(cost,2)}
 
-    return {
-        "total_room_area": round(total_room_area, 2),
-        "total_sprinklers": total_sprinklers,
-        "estimated_cost": round(total_cost, 2),
-    }
+def generate_technical_report(layout: dict, filename: str = None) -> str:
+    now = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    uid = uuid.uuid4().hex[:6]
+    fname = filename or f"technical_report_{now}_{uid}.pdf"
+    path = os.path.join(OUTPUT_DIR, fname)
 
-def generate_report(layout_data, cost_data, output_path="design_report.pdf"):
-    """Creates a professional report summarizing design and cost."""
-    doc = SimpleDocTemplate(output_path, pagesize=A4)
+    doc = SimpleDocTemplate(path, pagesize=A4)
     styles = getSampleStyleSheet()
     story = []
 
-    # Title
-    story.append(Paragraph("🏗️ Project Design Report", styles["Title"]))
-    story.append(Spacer(1, 0.5 * cm))
+    title = Paragraph("FireAI — Technical Report", styles["Title"])
+    story.append(title)
+    story.append(Spacer(1,12))
 
-    # Summary
-    story.append(Paragraph("📋 Layout Summary", styles["Heading2"]))
+    # Summary table
     data = [["Room", "Width (mm)", "Height (mm)", "Area (m²)"]]
-    for room in layout_data.get("rooms", []):
-        area = (room["width"] * room["height"]) / 1_000_000
-        data.append([room["name"], room["width"], room["height"], round(area, 2)])
+    for r in layout.get("rooms", []):
+        w = float(r.get("width",0)); h = float(r.get("height",0))
+        area = (w * h) / 1_000_000.0
+        data.append([r.get("name",""), str(w), str(h), f"{area:.2f}"])
 
-    table = Table(data, hAlign="LEFT")
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("FONT", (0, 0), (-1, 0), "Helvetica-Bold"),
+    t = Table(data)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.lightblue),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey)
     ]))
-    story.append(table)
-    story.append(Spacer(1, 0.5 * cm))
+    story.append(Paragraph("Layout Summary", styles["Heading2"]))
+    story.append(t)
+    story.append(Spacer(1,12))
 
-    # Sprinkler summary
-    story.append(Paragraph("💧 Sprinklers", styles["Heading2"]))
-    story.append(Paragraph(f"Total sprinklers: {cost_data['total_sprinklers']}", styles["Normal"]))
-    story.append(Spacer(1, 0.5 * cm))
-
-    # Cost summary
-    story.append(Paragraph("💰 Cost Summary", styles["Heading2"]))
-    cost_table = Table([
-        ["Total Area (m²)", cost_data["total_room_area"]],
-        ["Sprinkler Count", cost_data["total_sprinklers"]],
-        ["Estimated Cost (TND)", cost_data["estimated_cost"]],
-    ], hAlign="LEFT")
-    cost_table.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-    ]))
-    story.append(cost_table)
+    story.append(Paragraph("Sprinkler Positions", styles["Heading2"]))
+    for idx, s in enumerate(layout.get("sprinklers", []), start=1):
+        story.append(Paragraph(f"{idx}. x: {s.get('x')} mm, y: {s.get('y')} mm", styles["Normal"]))
 
     doc.build(story)
-    print(f"✅ Report generated: {output_path}")
+    return path
+
+def generate_financial_report(layout: dict, filename: str = None) -> str:
+    now = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    uid = uuid.uuid4().hex[:6]
+    fname = filename or f"financial_report_{now}_{uid}.pdf"
+    path = os.path.join(OUTPUT_DIR, fname)
+
+    cost = estimate_cost(layout)
+    doc = SimpleDocTemplate(path, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("FireAI — Financial Estimate", styles["Title"]))
+    story.append(Spacer(1,12))
+    story.append(Paragraph(f"Total area (m²): {cost['total_area_m2']}", styles["Normal"]))
+    story.append(Paragraph(f"Total sprinklers: {cost['total_sprinklers']}", styles["Normal"]))
+    story.append(Spacer(1,12))
+    story.append(Paragraph(f"Estimated cost: {cost['estimated_cost']} (currency)", styles["Heading2"]))
+
+    doc.build(story)
+    return path

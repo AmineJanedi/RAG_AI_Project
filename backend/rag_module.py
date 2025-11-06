@@ -1,22 +1,57 @@
 # backend/rag_module.py
+"""
+Minimal RAG placeholder. For now, we provide simple text extraction
+from PDFs and a naive substring search to return context snippets.
 
-from langchain.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OllamaEmbeddings
-from langchain.vectorstores import Chroma
+Replace with LangChain + Chroma/FAISS or LlamaIndex for semantic search.
+"""
 
-def setup_rag():
-    loader = PyPDFLoader("company_docs/nfpa_standards.pdf")
-    docs = loader.load()
+import os
+from typing import List
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks = splitter.split_documents(docs)
+DOCS_DIR = os.path.join(os.path.dirname(__file__), "../company_docs")
 
-    embeddings = OllamaEmbeddings(model="llama3")
-    db = Chroma.from_documents(chunks, embeddings, persist_directory="chroma_db")
-    db.persist()
-    return db
+def extract_text_from_pdf(path: str) -> str:
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(path)
+        text = []
+        for p in reader.pages:
+            t = p.extract_text() or ""
+            text.append(t)
+        return "\n".join(text)
+    except Exception:
+        return ""
 
-def query_rag(db, query):
-    results = db.similarity_search(query, k=3)
-    return "\n\n".join([r.page_content for r in results])
+# Build simple in-memory index (filename -> text)
+_index = None
+def _ensure_index():
+    global _index
+    if _index is None:
+        _index = {}
+        if not os.path.exists(DOCS_DIR):
+            return
+        for fname in os.listdir(DOCS_DIR):
+            if fname.lower().endswith(".pdf"):
+                fpath = os.path.join(DOCS_DIR, fname)
+                _index[fname] = extract_text_from_pdf(fpath)
+
+def query_rag(query: str, k: int = 3) -> str:
+    """
+    Naive substring matching: returns up to k matching snippets across docs.
+    """
+    _ensure_index()
+    if not query:
+        return ""
+    query_lower = query.lower()
+    snippets = []
+    for fname, text in _index.items():
+        idx = text.lower().find(query_lower)
+        if idx != -1:
+            start = max(0, idx - 200)
+            end = min(len(text), idx + 200)
+            snippets.append(text[start:end].strip().replace("\n", " "))
+        # stop early if we have enough
+        if len(snippets) >= k:
+            break
+    return "\n\n".join(snippets[:k])

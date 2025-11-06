@@ -8,3 +8,4 @@ tiktoken
 ezdxf
 reportlab
 requests
+python-dotenv
